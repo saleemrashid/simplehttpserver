@@ -1,0 +1,43 @@
+                                simplehttpserver
+
+
+Proof of concept event-driven HTTP server written in C99. Inspired by
+SimpleHTTPServer from Python. Do not use in production!
+
+FEATURES
+
+ - Supports 32-bit and 64-bit Linux. _FILE_OFFSET_BITS=64 from
+   feature_test_macros(7) is used for Large File Support on 32-bit Linux.
+
+ - No dynamic memory allocation. Uses a linked-list allocator to maintain
+   connection state. Sockets are left in the kernel backlog while the allocator
+   has no free connection objects.
+
+ - Single-threaded, event-driven architecture based on epoll(7).
+
+ - Uses Edge Triggered behaviour (EPOLLET) rather than Level Triggered
+   behaviour to maximize event retrieval efficiency.
+
+ - Correctly encodes special characters in the directory listings. Handles URL
+   encoding and collapses up-level references in paths to prevent path
+   traversal.
+
+ISSUES
+
+ - Do not use in production! Likely to have denial of service, buffer overflow,
+   or path traversal security vulnerabilities.
+
+ - Only supports Linux as it depends on accept4(2), epoll(7), and sendfile(2).
+
+ - Some HEAD requests still include a response entity.
+
+ - Directory listings are unsorted.
+
+ - Error handling uses err(3) and warn(3) which makes it more difficult to
+   diagnose bugs.
+
+ - Extraordinarily long filenames or paths are not handled gracefully.
+
+ - Inactive clients are not timed out. Need to implement a priority queue of
+   connections and close sockets that have been idle for too long.
+
