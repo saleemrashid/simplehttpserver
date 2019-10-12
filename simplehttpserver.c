@@ -162,6 +162,10 @@ static bool server_handle_accept(int epfd, int sockfd);
 
 static void server_handle_request(Connection *connection);
 static void server_handle_request_parse(Connection *connection);
+static void server_handle_request_serve(Connection *connection, int fd,
+                                        const char *decoded, const char *path,
+                                        bool request_dir, bool dir_allowed);
+
 static inline void server_handle_response_buffer(Connection *connection);
 static inline void server_handle_response_ptr(Connection *connection);
 static void server_handle_response_file(Connection *connection);
@@ -748,9 +752,20 @@ static void server_handle_request_parse(Connection *connection) {
     return;
   }
 
+  server_handle_request_serve(connection, fd, decoded, path, request_dir, true);
+}
+
+/*
+ * Serves the response for a given file descriptor. If a default page exists in
+ * the directory, it will recurse at most once to serve the file. Otherwise, it
+ * will generate a directory listing.
+ */
+static void server_handle_request_serve(Connection *connection, int fd,
+                                        const char *decoded, const char *path,
+                                        bool request_dir, bool dir_allowed) {
   struct stat st;
   if (fstat(fd, &st) != 0) {
-    warn("server_handle_request_parse: fstat");
+    warn("server_handle_request_serve: fstat");
     connection_http_error_404_not_found(connection);
     return;
   }
@@ -758,7 +773,7 @@ static void server_handle_request_parse(Connection *connection) {
   bool is_dir;
   if (S_ISREG(st.st_mode)) {
     is_dir = false;
-  } else if (S_ISDIR(st.st_mode)) {
+  } else if (dir_allowed && S_ISDIR(st.st_mode)) {
     is_dir = true;
   } else {
     connection_http_error_404_not_found(connection);
@@ -768,9 +783,23 @@ static void server_handle_request_parse(Connection *connection) {
   if (is_dir) {
     if (!request_dir) {
       connection_init_response_redirect_dir(connection, decoded);
-    } else {
-      connection_init_response_index(connection, fd, path);
+      return;
     }
+
+    int htmlfd;
+    if ((htmlfd = openat(fd, "index.html", 0)) < 0 &&
+        (htmlfd = openat(fd, "index.htm", 0)) < 0) {
+      /* Generate a directory listing because there's no default page */
+      connection_init_response_index(connection, fd, path);
+      return;
+    }
+
+    if (close(fd) != 0) {
+      warn("server_handle_request_serve: close");
+    }
+    /* Because dir_allowed is now false, we will not recurse again */
+    server_handle_request_serve(connection, htmlfd, decoded, path, request_dir,
+                                false);
   } else {
     connection_init_response_file(connection, fd, &st);
   }
