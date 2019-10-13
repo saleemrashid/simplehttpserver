@@ -22,6 +22,7 @@
  */
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
+#include <ctype.h>
 #include <dirent.h>
 #include <err.h>
 #include <errno.h>
@@ -150,6 +151,8 @@ static inline bool has_request_finished(const uint8_t *buffer, size_t offset,
                                         size_t count);
 
 static ssize_t uridecode(const char *uri, size_t uri_count, char *buffer,
+                         size_t count);
+static ssize_t uriencode(const uint8_t *str, size_t str_count, char *buffer,
                          size_t count);
 static ssize_t normpath(const char *path, size_t path_count, char *buffer,
                         size_t count);
@@ -343,6 +346,53 @@ static ssize_t uridecode(const char *uri, size_t uri_count, char *buffer,
       uri_next += 2;
     } else if (uri_next < uri_count) {
       buffer[offset++] = '%';
+    }
+  }
+
+  buffer[offset] = '\0';
+  return offset;
+}
+
+static ssize_t uriencode(const uint8_t *str, size_t str_count, char *buffer,
+                         size_t count) {
+  static const char *hex_digits = "0123456789ABCDEF";
+
+  /* Output will be at least as long as input and needs null terminator */
+  if (count <= str_count) {
+    return -1;
+  }
+  size_t offset = 0;
+
+  for (size_t i = 0; i < str_count; i++) {
+    uint8_t ch = str[i];
+
+    bool escape;
+    switch (ch) {
+      case '-':
+      case '.':
+      case '_':
+      case '~':
+        escape = false;
+        break;
+      default:
+        escape = !isalnum(ch);
+        break;
+    }
+
+    if (escape) {
+      /* Need to fit null terminator */
+      if (offset + 3 >= count) {
+        return -1;
+      }
+      buffer[offset++] = '%';
+      buffer[offset++] = hex_digits[(ch >> 4) & 0xf];
+      buffer[offset++] = hex_digits[ch & 0xf];
+    } else {
+      /* Need to fit null terminator */
+      if (offset + 1 >= count) {
+        return -1;
+      }
+      buffer[offset++] = ch;
     }
   }
 
@@ -884,6 +934,11 @@ static void server_handle_response_index(Connection *connection) {
 
     response->count = 0;
 
+    char href[PATH_MAX];
+    if (uriencode((const uint8_t *)dirent->d_name, strlen(dirent->d_name), href,
+                  sizeof(href)) <= 0) {
+      continue;
+    }
     char name[PATH_MAX];
     if (htmlentities(dirent->d_name, name, sizeof(name)) <= 0) {
       continue;
@@ -907,7 +962,7 @@ static void server_handle_response_index(Connection *connection) {
     }
 
     int n = snprintf(response->buffer, CONNECTION_RESPONSE_INDEX_BUFFER_MAX,
-                     "<li><a href=\"%s%s\">%s%s</a></li>", name, hrefsuffix,
+                     "<li><a href=\"%s%s\">%s%s</a></li>", href, hrefsuffix,
                      name, suffix);
     if (n < 0) {
       warn("server_handle_response_index: snprintf");
