@@ -31,6 +31,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -137,9 +138,15 @@ union ConnectionAllocatorItem {
 };
 
 static union ConnectionAllocatorItem
-    connection_freelist[CONNECTION_FREELIST_MAX];
+    _connection_freelist[CONNECTION_FREELIST_MAX];
+
+static union ConnectionAllocatorItem *_Atomic connection_freelist_head;
 
 static struct epoll_event server_events[SERVER_EVENTS_MAX];
+
+static int server_epfd;
+static const Connection *server_connection;
+static atomic_flag no_pending_accept = ATOMIC_FLAG_INIT;
 
 static inline bool memchr_offset(const uint8_t *buffer, uint8_t ch,
                                  size_t *offset, size_t count);
@@ -194,14 +201,14 @@ static inline void connection_cleanup(Connection *connection);
 static inline void connection_set_state(Connection *connection,
                                         ConnectionState new_state);
 
-static inline Connection *server_connection_add(int epfd, int fd);
+static inline bool server_connection_add(Connection *connection, int epfd,
+                                         int fd);
 static inline int server_connection_epoll(int epfd, int op,
                                           Connection *connection, int events);
 static inline void server_connection_remove(int epfd, Connection *connection,
                                             bool error);
 
 static inline void connection_allocator_init(void);
-static inline bool connection_allocator_full(void);
 static inline Connection *connection_alloc(void);
 static inline void connection_free(Connection *connection);
 
@@ -520,23 +527,26 @@ static void server_main(uint16_t port) {
     err(1, "server_main: signal");
   }
 
-  int epfd = epoll_create1(0);
-  if (epfd < 0) {
+  server_epfd = epoll_create1(0);
+  if (server_epfd < 0) {
     err(1, "server_main: epoll_create1");
   }
 
-  Connection *server_connection = server_bind(epfd, port);
-  bool pending_accept = false;
+  server_connection = server_bind(server_epfd, port);
+  atomic_flag_test_and_set(&no_pending_accept);
 
   while (true) {
     /*
      * Handle any pending connections otherwise Edge Triggered eventpoll will
      * never notify us again.
      */
-    if (pending_accept) {
-      pending_accept = server_handle_accept(epfd, server_connection->fd);
+    if (!atomic_flag_test_and_set(&no_pending_accept)) {
+      if (server_handle_accept(server_epfd, server_connection->fd)) {
+        atomic_flag_clear(&no_pending_accept);
+      }
     }
-    int numevents = epoll_wait(epfd, server_events, SERVER_EVENTS_MAX, -1);
+    int numevents =
+        epoll_wait(server_epfd, server_events, SERVER_EVENTS_MAX, -1);
     if (numevents < 0) {
       err(1, "server_main: epoll_wait");
     }
@@ -553,7 +563,9 @@ static void server_main(uint16_t port) {
            * pending connections. If we cannot handle all of them immediately,
            * we must manually remember to handle them later.
            */
-          pending_accept = server_handle_accept(epfd, server_connection->fd);
+          if (server_handle_accept(server_epfd, server_connection->fd)) {
+            atomic_flag_clear(&no_pending_accept);
+          }
         }
       } else {
         if (events & EPOLLERR) {
@@ -586,7 +598,8 @@ static void server_main(uint16_t port) {
                * Stop receiving EPOLLIN events; we're only interested in
                * EPOLLOUT now.
                */
-              if (server_connection_epoll(epfd, EPOLL_CTL_MOD, connection,
+              if (server_connection_epoll(server_epfd, EPOLL_CTL_MOD,
+                                          connection,
                                           EPOLLOUT | EPOLLET) != 0) {
                 warn("server_main: epoll_ctl");
                 goto err;
@@ -616,13 +629,13 @@ static void server_main(uint16_t port) {
           }
         }
         if (connection->state == ConnectionStateFinished) {
-          server_connection_remove(epfd, connection, false);
+          server_connection_remove(server_epfd, connection, false);
           continue;
         }
         if (connection->state == ConnectionStateError) {
         err:
           connection_set_state(connection, ConnectionStateError);
-          server_connection_remove(epfd, connection, true);
+          server_connection_remove(server_epfd, connection, true);
           continue;
         }
       }
@@ -651,8 +664,12 @@ static Connection *server_bind(int epfd, uint16_t port) {
   if (listen(fd, SOMAXCONN) != 0) {
     err(1, "server_bind: listen");
   }
-  Connection *connection = server_connection_add(epfd, fd);
+  Connection *connection = connection_alloc();
   if (connection == NULL) {
+    errno = ENOMEM;
+    err(1, "server_bind: connection_alloc");
+  }
+  if (!server_connection_add(connection, epfd, fd)) {
     err(1, "server_bind: server_connection_add");
   }
   return connection;
@@ -661,7 +678,8 @@ static Connection *server_bind(int epfd, uint16_t port) {
 /* Accept connections and return whether there are still pending connections */
 static bool server_handle_accept(int epfd, int sockfd) {
   while (true) {
-    if (connection_allocator_full()) {
+    Connection *connection = connection_alloc();
+    if (connection == NULL) {
       /*
        * Defer a potential pending connection as we cannot allocate a Connection
        * structure.
@@ -671,12 +689,13 @@ static bool server_handle_accept(int epfd, int sockfd) {
     int fd = accept4(sockfd, NULL, NULL, SOCK_NONBLOCK);
     if (fd < 0) {
       if (ERR_IS_WOULDBLOCK(errno)) {
+        connection_free(connection);
         return false;
       }
       warn("server_handle_accept: accept4");
       return true;
     }
-    if (server_connection_add(epfd, fd) == NULL) {
+    if (!server_connection_add(connection, epfd, fd)) {
       warn("server_handle_accept: server_connection_add");
       if (close(fd) != 0) {
         warn("server_handle_accept: close");
@@ -1139,25 +1158,17 @@ static inline void connection_set_state(Connection *connection,
   connection->state = new_state;
 }
 
-/* Allocate Connection structure and add file descriptor to eventpoll */
-static inline Connection *server_connection_add(int epfd, int fd) {
-  Connection *connection = connection_alloc();
-  if (connection == NULL) {
-    /*
-     * The caller should have checked this condition before accepting the
-     * connection
-     */
-    warn("server_connection_add: connection_alloc");
-    return NULL;
-  }
+/* Initialize Connection and add file descriptor to eventpoll */
+static inline bool server_connection_add(Connection *connection, int epfd,
+                                         int fd) {
   *connection = (const Connection){.fd = fd};
   if (server_connection_epoll(epfd, EPOLL_CTL_ADD, connection,
                               EPOLLIN | EPOLLRDHUP | EPOLLET) != 0) {
     warn("server_connection_add: epoll_ctl");
     connection_free(connection);
-    return NULL;
+    return false;
   }
-  return connection;
+  return true;
 }
 
 static inline int server_connection_epoll(int epfd, int op,
@@ -1188,23 +1199,21 @@ static inline void server_connection_remove(int epfd, Connection *connection,
 /* Initialize the freelist as a linked list of unused Connection structures */
 static inline void connection_allocator_init(void) {
   for (size_t i = 0; i + 1 < CONNECTION_FREELIST_MAX; i++) {
-    connection_freelist[i].next = &connection_freelist[i + 1];
+    _connection_freelist[i].next = &_connection_freelist[i + 1];
   }
-  connection_freelist[CONNECTION_FREELIST_MAX - 1].next = NULL;
-}
-
-static inline bool connection_allocator_full(void) {
-  return connection_freelist->next == NULL;
+  _connection_freelist[CONNECTION_FREELIST_MAX - 1].next = NULL;
+  connection_freelist_head = _connection_freelist;
 }
 
 /* Remove and return a Connection structure from the freelist */
 static inline Connection *connection_alloc(void) {
-  union ConnectionAllocatorItem *item = connection_freelist->next;
-  if (item == NULL) {
-    errno = ENOMEM;
-    return NULL;
-  }
-  connection_freelist->next = item->next;
+  union ConnectionAllocatorItem *item = connection_freelist_head;
+  do {
+    if (item == NULL) {
+      return NULL;
+    }
+  } while (!atomic_compare_exchange_weak(&connection_freelist_head, &item,
+                                         item->next));
   return &item->connection;
 }
 
@@ -1212,6 +1221,8 @@ static inline Connection *connection_alloc(void) {
 static inline void connection_free(Connection *connection) {
   union ConnectionAllocatorItem *item =
       (union ConnectionAllocatorItem *)connection;
-  item->next = connection_freelist->next;
-  connection_freelist->next = item;
+  item->next = connection_freelist_head;
+  while (!atomic_compare_exchange_weak(&connection_freelist_head, &item->next,
+                                       item))
+    ;
 }
