@@ -1,7 +1,7 @@
                                 simplehttpserver
 
 
-Proof of concept event-driven HTTP server written in C99. Inspired by
+Proof of concept event-driven HTTP server written in C11. Inspired by
 SimpleHTTPServer from Python. Do not use in production!
 
 FEATURES
@@ -13,7 +13,7 @@ FEATURES
    connection state. Sockets are left in the kernel backlog while the allocator
    has no free connection objects.
 
- - Single-threaded, event-driven architecture based on epoll(7).
+ - Multi-threaded, event-driven architecture based on epoll(7).
 
  - Uses Edge Triggered behaviour (EPOLLET) rather than Level Triggered
    behaviour to maximize event retrieval efficiency.

@@ -1,5 +1,5 @@
 CC     := clang
-CFLAGS := -std=c11 -pedantic -g -O3 -Wall -Wextra -Werror
+CFLAGS := -std=c11 -pedantic -g -O3 -Wall -Wextra -Werror -pthread
 
 EXENAME := simplehttpserver
 

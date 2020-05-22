@@ -41,6 +41,7 @@
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <threads.h>
 #include <unistd.h>
 
 #define CONNECTION_FREELIST_MAX 256
@@ -51,6 +52,7 @@
 
 #define SERVER_PORT UINT16_C(8000)
 #define SERVER_EVENTS_MAX (CONNECTION_FREELIST_MAX + 1)
+#define THREADS_COUNT 4
 
 /* POSIX.1-2001 allows either error to be returned */
 #define ERR_IS_WOULDBLOCK(ERR) ((ERR) == EAGAIN || (ERR) == EWOULDBLOCK)
@@ -122,8 +124,11 @@ typedef struct {
     struct Connection_response_file response_file;
     struct Connection_response_index response_index;
   } u;
+  uint_fast64_t token;
+  atomic_int events;
   int fd;
   ConnectionState state;
+  atomic_flag lock;
   /* Whether to send headers only (HEAD), or include a response body (GET) */
   bool headers_only : 1;
 } Connection;
@@ -142,8 +147,10 @@ static union ConnectionAllocatorItem
 
 static union ConnectionAllocatorItem *_Atomic connection_freelist_head;
 
-static struct epoll_event server_events[SERVER_EVENTS_MAX];
+static atomic_uint_fast64_t server_token = ATOMIC_VAR_INIT(0);
+static mtx_t server_token_mutex;
 
+struct epoll_event server_events_buffer[THREADS_COUNT][SERVER_EVENTS_MAX];
 static int server_epfd;
 static const Connection *server_connection;
 static atomic_flag no_pending_accept = ATOMIC_FLAG_INIT;
@@ -166,6 +173,7 @@ static ssize_t normpath(const char *path, size_t path_count, char *buffer,
 static ssize_t htmlentities(const char *str, char *buffer, size_t count);
 
 static void server_main(uint16_t port);
+static int server_thread_main(void *arg);
 
 static Connection *server_bind(int epfd, uint16_t port);
 static bool server_handle_accept(int epfd, int sockfd);
@@ -532,8 +540,25 @@ static void server_main(uint16_t port) {
     err(1, "server_main: epoll_create1");
   }
 
+  if (mtx_init(&server_token_mutex, mtx_plain) != thrd_success) {
+    err(1, "server_main: mtx_init");
+  }
+
   server_connection = server_bind(server_epfd, port);
   atomic_flag_test_and_set(&no_pending_accept);
+
+  thrd_t thr;
+  for (unsigned int i = 1; i < THREADS_COUNT; i++) {
+    if (thrd_create(&thr, server_thread_main, server_events_buffer[i]) !=
+        thrd_success) {
+      err(1, "server_main: thrd_create");
+    }
+  }
+  server_thread_main(server_events_buffer[0]);
+}
+
+static int server_thread_main(void *arg) {
+  struct epoll_event *server_events = (struct epoll_event *)arg;
 
   while (true) {
     /*
@@ -545,17 +570,42 @@ static void server_main(uint16_t port) {
         atomic_flag_clear(&no_pending_accept);
       }
     }
+    if (mtx_lock(&server_token_mutex) != thrd_success) {
+      err(1, "server_thread_main: mtx_lock");
+    }
     int numevents =
         epoll_wait(server_epfd, server_events, SERVER_EVENTS_MAX, -1);
+    /*
+     * We need to detect if a connection was re-used between the
+     * epoll_wait and this thread handling the events, because then the event no
+     * longer corresponds to the active connection.
+     *
+     * We store the current server_token in connection->token when the
+     * connection is allocated. Then we fetch and increment server_token here,
+     * and if we see a connection with a greater token, we ignore it because it
+     * must have been re-used.
+     *
+     * We have to use a mutex here, because there's a race window between the
+     * epoll_wait and loading server_token. If we load the token before, a
+     * connection might be re-used before epoll_wait and we will receive an
+     * event for this new connection, but mistakenly discard the event (this is
+     * catastrophic because Edge Triggered eventpoll will never notify us for
+     * that connection again). If we load the token after, we might not detect
+     * that a connection was re-used in the meantime.
+     */
+    uint_fast64_t token = atomic_fetch_add(&server_token, 1);
+    if (mtx_unlock(&server_token_mutex) != thrd_success) {
+      err(1, "server_thread_main: mtx_unlock");
+    }
     if (numevents < 0) {
-      err(1, "server_main: epoll_wait");
+      err(1, "server_thread_main: epoll_wait");
     }
     for (int i = 0; i < numevents; i++) {
       int events = server_events[i].events;
       Connection *connection = server_events[i].data.ptr;
       if (connection == server_connection) {
         if (events & (EPOLLHUP | EPOLLERR)) {
-          errx(1, "server_main: Error on server socket");
+          errx(1, "server_thread_main: Error on server socket");
         }
         if (events & EPOLLIN) {
           /*
@@ -567,76 +617,86 @@ static void server_main(uint16_t port) {
             atomic_flag_clear(&no_pending_accept);
           }
         }
-      } else {
-        if (events & EPOLLERR) {
-          warnx("server_main: Error on client socket");
-          goto err;
+      } else if (connection->token <= token) {
+        if (atomic_flag_test_and_set(&connection->lock)) {
+          atomic_fetch_or(&connection->events, events);
+          continue;
         }
-        if (events & EPOLLHUP) {
-          warnx("server_main: Hang-up on client socket");
-          goto err;
-        }
-        if (events & EPOLLIN) {
-          if (connection->state != ConnectionStateRequest) {
-            warnx("server_main: Unexpected EPOLLIN");
+        while (true) {
+          if (events & EPOLLERR) {
+            warnx("server_thread_main: Error on client socket");
             goto err;
           }
-          server_handle_request(connection);
-
-          switch (connection->state) {
-            case ConnectionStateRequest:
-            case ConnectionStateFinished:
-              break;
-            case ConnectionStateError:
+          if (events & EPOLLHUP) {
+            warnx("server_thread_main: Hang-up on client socket");
+            goto err;
+          }
+          if (events & EPOLLIN) {
+            if (connection->state != ConnectionStateRequest) {
+              warnx("server_thread_main: Unexpected EPOLLIN");
               goto err;
+            }
+            server_handle_request(connection);
 
-            case ConnectionStateResponseBuffer:
-            case ConnectionStateResponsePtr:
-            case ConnectionStateResponseFile:
-            case ConnectionStateResponseIndex:
-              /*
-               * Stop receiving EPOLLIN events; we're only interested in
-               * EPOLLOUT now.
-               */
-              if (server_connection_epoll(server_epfd, EPOLL_CTL_MOD,
-                                          connection,
-                                          EPOLLOUT | EPOLLET) != 0) {
-                warn("server_main: epoll_ctl");
+            switch (connection->state) {
+              case ConnectionStateRequest:
+              case ConnectionStateFinished:
+                break;
+              case ConnectionStateError:
                 goto err;
-              }
-              break;
+
+              case ConnectionStateResponseBuffer:
+              case ConnectionStateResponsePtr:
+              case ConnectionStateResponseFile:
+              case ConnectionStateResponseIndex:
+                /*
+                 * Stop receiving EPOLLIN events; we're only interested in
+                 * EPOLLOUT now.
+                 */
+                if (server_connection_epoll(server_epfd, EPOLL_CTL_MOD,
+                                            connection,
+                                            EPOLLOUT | EPOLLET) != 0) {
+                  warn("server_thread_main: epoll_ctl");
+                  goto err;
+                }
+                break;
+            }
           }
-        }
-        if (events & EPOLLOUT) {
-          switch (connection->state) {
-            case ConnectionStateRequest:
-            case ConnectionStateError:
-            case ConnectionStateFinished:
-              warnx("server_main: Unexpected EPOLLOUT");
-              goto err;
-            case ConnectionStateResponseBuffer:
-              server_handle_response_buffer(connection);
-              break;
-            case ConnectionStateResponsePtr:
-              server_handle_response_ptr(connection);
-              break;
-            case ConnectionStateResponseFile:
-              server_handle_response_file(connection);
-              break;
-            case ConnectionStateResponseIndex:
-              server_handle_response_index(connection);
-              break;
+          if (events & EPOLLOUT) {
+            switch (connection->state) {
+              case ConnectionStateRequest:
+              case ConnectionStateError:
+              case ConnectionStateFinished:
+                warnx("server_thread_main: Unexpected EPOLLOUT");
+                goto err;
+              case ConnectionStateResponseBuffer:
+                server_handle_response_buffer(connection);
+                break;
+              case ConnectionStateResponsePtr:
+                server_handle_response_ptr(connection);
+                break;
+              case ConnectionStateResponseFile:
+                server_handle_response_file(connection);
+                break;
+              case ConnectionStateResponseIndex:
+                server_handle_response_index(connection);
+                break;
+            }
           }
-        }
-        if (connection->state == ConnectionStateFinished) {
-          server_connection_remove(server_epfd, connection, false);
-          continue;
-        }
-        if (connection->state == ConnectionStateError) {
-        err:
-          connection_set_state(connection, ConnectionStateError);
-          server_connection_remove(server_epfd, connection, true);
-          continue;
+          if (connection->state == ConnectionStateFinished) {
+            server_connection_remove(server_epfd, connection, false);
+            break;
+          }
+          if (connection->state == ConnectionStateError) {
+          err:
+            connection_set_state(connection, ConnectionStateError);
+            server_connection_remove(server_epfd, connection, true);
+            break;
+          }
+          if ((events = atomic_exchange(&connection->events, 0)) == 0) {
+            atomic_flag_clear(&connection->lock);
+            break;
+          }
         }
       }
     }
@@ -726,7 +786,9 @@ static void server_handle_request(Connection *connection) {
       if (ERR_IS_WOULDBLOCK(errno)) {
         break;
       }
-      warn("server_handle_request: recvbuffer");
+      if (n < 0) {
+        warn("server_handle_request: recvbuffer");
+      }
       connection_set_state(connection, ConnectionStateError);
       return;
     }
@@ -1161,7 +1223,10 @@ static inline void connection_set_state(Connection *connection,
 /* Initialize Connection and add file descriptor to eventpoll */
 static inline bool server_connection_add(Connection *connection, int epfd,
                                          int fd) {
-  *connection = (const Connection){.fd = fd};
+  *connection = (const Connection){.token = server_token,
+                                   .events = ATOMIC_VAR_INIT(0),
+                                   .fd = fd,
+                                   .lock = ATOMIC_FLAG_INIT};
   if (server_connection_epoll(epfd, EPOLL_CTL_ADD, connection,
                               EPOLLIN | EPOLLRDHUP | EPOLLET) != 0) {
     warn("server_connection_add: epoll_ctl");
@@ -1182,6 +1247,11 @@ static inline int server_connection_epoll(int epfd, int op,
 
 static inline void server_connection_remove(int epfd, Connection *connection,
                                             bool error) {
+  /*
+   * This isn't necessary, because connection->lock is still set, but setting
+   * this eliminates an expensive atomic test-and-set on connection->lock.
+   */
+  connection->token = UINT_FAST64_MAX;
   if (epoll_ctl(epfd, EPOLL_CTL_DEL, connection->fd, NULL) != 0) {
     warn("server_connection_remove: epoll_ctl");
   }
